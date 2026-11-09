@@ -1,4 +1,4 @@
-﻿// Small image helper for cutting sprites out of the user's sprite sheets (WIC decodes WebP on Windows).
+// Small image helper for cutting sprites out of the user's sprite sheets (WIC decodes WebP on Windows).
 // Used from tools/cut_moto.ps1 via Add-Type. Not part of the game runtime.
 using System;
 using System.IO;
@@ -138,6 +138,69 @@ public class Img {
     int dx = (s - W) / 2, dy = (s - H) / 2;
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { int i = (y * W + x) * 4; if (P[i + 3] > 0) Array.Copy(P, i, o.P, ((y + dy) * s + x + dx) * 4, 4); }
     return o;
+  }
+  // grow transparency through purple/lavender pixels (panel background gradients and panel border lines)
+  public void KeyOutPurple() {
+    var st = new Stack<int>(); var seen = new bool[W * H];
+    for (int p = 0; p < W * H; p++) if (P[p * 4 + 3] == 0) { seen[p] = true; st.Push(p); }
+    for (int x = 0; x < W; x++) { st.Push(x); st.Push((H - 1) * W + x); }
+    for (int y = 0; y < H; y++) { st.Push(y * W); st.Push(y * W + W - 1); }
+    Func<int, bool> purple = q => { int i = q * 4, r = P[i + 2], g = P[i + 1], b = P[i], lum = (r * 3 + g * 6 + b) / 10; int mx = Math.Max(r, Math.Max(g, b)), mn = Math.Min(r, Math.Min(g, b)); return b - g > 10 && r - g > 8 && lum < 190 && mx - mn < 70; };
+    while (st.Count > 0) {
+      int p = st.Pop(), x = p % W;
+      if (!seen[p]) { if (!purple(p)) continue; seen[p] = true; P[p * 4 + 3] = 0; }
+      foreach (int q in new int[] { p - 1, p + 1, p - W, p + W }) {
+        if (q < 0 || q >= W * H || seen[q]) continue; if ((q == p - 1 && x == 0) || (q == p + 1 && x == W - 1)) continue;
+        if (purple(q)) { seen[q] = true; P[q * 4 + 3] = 0; st.Push(q); }
+      }
+    }
+  }
+  // Split a keyed strip into frames by vertical gaps between the bodies.
+  //  - thin long components (panel border lines) are erased first;
+  //  - green pixels (grass under the hooves, which often joins neighbouring frames) are ignored when looking for gaps;
+  //  - segments narrower than minW (e.g. "moo" sound marks) are merged into the segment on their left.
+  // Returns [x0, y0, x1, y1] (exclusive) per frame, left to right.
+  public List<int[]> SplitFrames(int minGap, int minW) { return SplitFramesN(minGap, minW, 0); }
+  // same, but forces exactly n frames when n > 0: the widest segment is cut at its thinnest column (bodies touching by a tail
+  // or hoof), extra tiny segments are merged into their nearest neighbour.
+  public List<int[]> SplitFramesN(int minGap, int minW, int n) {
+    foreach (var c in Components(1)) if (c[3] < 8 && c[2] > 120) for (int y = c[1]; y < c[1] + c[3]; y++) for (int x = c[0]; x < c[0] + c[2]; x++) P[(y * W + x) * 4 + 3] = 0;
+    var col = new int[W];
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+      int i = (y * W + x) * 4; if (P[i + 3] == 0) continue;
+      int r = P[i + 2], g = P[i + 1], b = P[i]; if (g > r + 12 && g > b + 12) continue; // grass
+      col[x]++;
+    }
+    var segs = new List<int[]>(); int s = -1, gap = 0;
+    for (int x = 0; x <= W; x++) {
+      bool on = x < W && col[x] > 0;
+      if (on) { if (s < 0) s = x; gap = 0; }
+      else if (s >= 0) { gap++; if (gap >= minGap || x == W) { segs.Add(new int[] { s, x - gap + 1 }); s = -1; gap = 0; } }
+    }
+    var merged = new List<int[]>();
+    foreach (var sg in segs) { if (sg[1] - sg[0] < minW && merged.Count > 0) merged[merged.Count - 1][1] = sg[1]; else merged.Add(sg); }
+    if (n > 0) {
+      while (merged.Count < n) {
+        int wi = 0; for (int k = 1; k < merged.Count; k++) if (merged[k][1] - merged[k][0] > merged[wi][1] - merged[wi][0]) wi = k;
+        int a = merged[wi][0], b = merged[wi][1], w = b - a, lo = a + (int)(w * 0.25), hi = a + (int)(w * 0.75), cut = lo;
+        // for a run of k frames glued together, look near the 1/k point first
+        int guess = (int)Math.Round((double)w / ((double)(merged.Count == 0 ? 1 : 1)));
+        for (int x = lo; x < hi; x++) if (col[x] < col[cut]) cut = x;
+        merged[wi] = new int[] { a, cut }; merged.Insert(wi + 1, new int[] { cut + 1, b });
+      }
+      while (merged.Count > n) {
+        int si = 0; for (int k = 1; k < merged.Count; k++) if (merged[k][1] - merged[k][0] < merged[si][1] - merged[si][0]) si = k;
+        int ni = si == 0 ? 1 : si == merged.Count - 1 ? si - 1 : (merged[si][0] - merged[si - 1][1] <= merged[si + 1][0] - merged[si][1] ? si - 1 : si + 1);
+        merged[ni] = new int[] { Math.Min(merged[ni][0], merged[si][0]), Math.Max(merged[ni][1], merged[si][1]) }; merged.RemoveAt(si);
+      }
+    }
+    var res = new List<int[]>();
+    foreach (var sg in merged) {
+      int y0 = H, y1 = -1;
+      for (int y = 0; y < H; y++) for (int x = sg[0]; x < sg[1]; x++) if (P[(y * W + x) * 4 + 3] > 0) { if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      if (y1 >= 0) res.Add(new int[] { sg[0], y0, sg[1], y1 + 1 });
+    }
+    return res;
   }
   // per-row opaque runs: "y: x0-x1 x0-x1 ..." (used to find where the legs start)
   public string RowRuns(int step) {
