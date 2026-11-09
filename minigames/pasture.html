@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Верба — Череда до вечора</title>
+<link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  html,body { margin:0; height:100%; background:#10161d; overflow:hidden; overscroll-behavior:none; }
+  body { display:flex; align-items:center; justify-content:center; touch-action:none; user-select:none; -webkit-user-select:none; }
+  canvas { display:block; touch-action:none; border:3px solid #e9d8a6; border-radius:4px; box-shadow:0 0 0 3px #34495a; }
+  #whip { position:fixed; right:18px; bottom:18px; width:76px; height:76px; border-radius:50%; border:2px solid #c9b47c; background:#7a2f37; color:#fff;
+    font:600 15px 'Pixelify Sans', monospace; display:none; touch-action:none; }
+  body.touch #whip { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="384" height="240"></canvas>
+<button id="whip" type="button" tabindex="-1">БАТІГ</button>
+<script>
+/* «Череда до вечора» — мінігра для «Понорницьких пригод».
+   Олег пасе череду на болоті від ранку до вечора: корови шукають соковиту траву, а самі так і пруть
+   через дірки в паркані на город. Олег відганяє їх, підходячи ближче, або ляскає батогом.
+   Спрайти корів і Олега — ті самі кадри 1:1 з листів користувача (assets/sprites/), усе інше намальовано кодом.
+   Місток із селом: pasture-ready → (pasture-init {name}) ; у кінці дня pasture-done {score, full, damage}; Esc → mini-close. */
+'use strict';
+const W = 384, H = 240, TS = 16, DAY = 100;
+const FONT = "'Pixelify Sans', ui-monospace, monospace";
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const embedded = window.parent !== window;
+const send = (type, x) => { if (embedded) try { parent.postMessage(Object.assign({ type }, x || {}), '*'); } catch (_) {} };
+
+// ---------- helpers (як у рушії села) ----------
+function hash(x, y, s = 0) { let v = (x * 374761393 + y * 668265263 + s * 1442695041) | 0; v = Math.imul(v ^ (v >>> 13), 1274126177); return ((v ^ (v >>> 16)) >>> 0) / 4294967295; }
+function vnoise(x, y, sc, s) {
+  const fx = x / sc, fy = y / sc, x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+  const a = hash(x0, y0, s), b = hash(x0 + 1, y0, s), c = hash(x0, y0 + 1, s), d = hash(x0 + 1, y0 + 1, s);
+  const sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
+  return (a + (b - a) * sx) * (1 - sy) + (c + (d - c) * sx) * sy;
+}
+function R(g, x, y, w, h, c) { g.fillStyle = c; g.fillRect(x, y, w, h); }
+function P1(g, x, y, c) { g.fillStyle = c; g.fillRect(x, y, 1, 1); }
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+// ---------- sprites 1:1 from the user's sheets ----------
+const load = src => { const im = new Image(); im.src = src; return im; };
+const COW = {};
+const ANIMS = { walk_down:4, walk_up:4, walk_left:3, walk_right:3, idle:2, eat:3, moo:2 };
+for (const v of ['spotted', 'holstein', 'red', 'brown']) { COW[v] = {}; for (const a in ANIMS) COW[v][a] = Array.from({ length:ANIMS[a] }, (_, i) => load(`../assets/sprites/cows/${v}_${a}_${i + 1}.png`)); }
+const FX = { heart:load('../assets/sprites/cows/fx_2.png'), alert:load('../assets/sprites/cows/fx_7.png'), grass:load('../assets/sprites/cows/fx_9.png'),
+  hay:load('../assets/sprites/cows/fx_10.png'), trough:load('../assets/sprites/cows/fx_11.png') };
+const HERO = { idle:{}, walk:{}, run:{} };
+for (const d of ['down', 'up', 'left', 'right']) {
+  HERO.idle[d] = load(`../assets/sprites/hero/idle_${d}.png`);
+  HERO.walk[d] = [1, 2, 3, 4].map(i => load(`../assets/sprites/hero/walk_${d}_${i}.png`));
+  HERO.run[d] = [1, 2, 3, 4].map(i => load(`../assets/sprites/hero/run_${d}_${i}.png`));
+}
+const COW_K = 0.33, HERO_K = 0.12;
+function sprite(img, cx, bottom, k, flip) {
+  if (!img || !img.complete || !img.naturalWidth) return false;
+  const w = img.naturalWidth * k, h = img.naturalHeight * k;
+  ctx.save(); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  if (flip) { ctx.translate(cx, 0); ctx.scale(-1, 1); ctx.drawImage(img, -w / 2, bottom - h, w, h); }
+  else ctx.drawImage(img, cx - w / 2, bottom - h, w, h);
+  ctx.restore();
+  return true;
+}
+function shadow(cx, y, rx) { ctx.fillStyle = 'rgba(20,40,20,.30)'; ctx.beginPath(); ctx.ellipse(cx, y, rx, 2.5, 0, 0, Math.PI * 2); ctx.fill(); }
+
+// ---------- поле гри ----------
+// ряди 0–1 — город з картоплею; ряд 2 — дощаний паркан із двома дірками; нижче — болото; по краях очерет.
+const FIELD_Y = 58;                       // нижній край городу (над ним — панель із показниками)
+const FENCE = { y0:54, y1:72 };           // смуга паркану (для зіткнень)
+const GAPS = [{ x0:96, x1:128 }, { x0:256, x1:288 }];
+const inGap = (x, r) => GAPS.some(g => x - r >= g.x0 && x + r <= g.x1);
+const BOUND = { x0:20, x1:364, y0:45, y1:222 };
+const PROPS = [
+  { k:'trough', x:196, y:206, w:30, h:8, img:'trough', s:0.36 },
+  { k:'hay', x:334, y:100, w:26, h:8, img:'hay', s:0.3 },
+];
+function blocked(x, y, r) {
+  if (x < BOUND.x0 + r || x > BOUND.x1 - r || y < BOUND.y0 || y > BOUND.y1) return true;
+  if (y > FENCE.y0 && y < FENCE.y1 && !inGap(x, r)) return true;
+  for (const p of PROPS) if (Math.abs(x - p.x) < p.w / 2 + r && y > p.y - p.h && y < p.y + 3) return true;
+  return false;
+}
+const inField = (x, y) => y < FIELD_Y;
+
+// ---------- статичне тло ----------
+const bg = document.createElement('canvas'); bg.width = W; bg.height = H;
+(function paintBg() {
+  const g = bg.getContext('2d');
+  for (let ty = 0; ty < 15; ty++) for (let tx = 0; tx < 24; tx++) {
+    const X = tx * TS, Y = ty * TS;
+    if (ty < 4) { // город: чорнозем із рядками картоплі
+      R(g, X, Y, TS, TS, '#5a4030');
+      for (let r = 0; r < 4; r++) { R(g, X, Y + r * 4, TS, 2, '#6f5039'); R(g, X, Y + r * 4 + 3, TS, 1, '#3f2c20'); }
+      for (let i = 0; i < 10; i++) P1(g, X + Math.floor(hash(tx, ty, 400 + i) * 16), Y + Math.floor(hash(tx, ty, 410 + i) * 16), i % 2 ? '#7a5a40' : '#33241a');
+      for (let r = 0; r < 4; r++) for (let i = 1 + (r % 2) * 2; i < TS - 1; i += 4) { const yy = Y + r * 4 + 1; R(g, X + i - 1, yy, 3, 2, '#4f8a3a'); P1(g, X + i, yy - 1, '#78b04e'); P1(g, X + i - 1, yy, '#6aa046'); }
+      continue;
+    }
+    // вологий луг (як болото у Вербі)
+    R(g, X, Y, TS, TS, '#557a3c');
+    for (let j = 0; j < TS; j += 2) for (let i = (j >> 1) % 2; i < TS; i += 2) {
+      const n = vnoise(X + i, Y + j, 34, 7);
+      if (n > 0.62) R(g, X + i, Y + j, 2, 2, '#6b8a44'); else if (n < 0.34) R(g, X + i, Y + j, 2, 2, '#43663a');
+    }
+    if (vnoise(tx, ty, 4, 17) > 0.62) for (let k = 0; k < 3; k++) { const a = 1 + Math.floor(hash(tx, ty, 500 + k) * 11), b = 2 + Math.floor(hash(tx, ty, 510 + k) * 12); R(g, X + a, Y + b, 4, 1, '#4f7480'); P1(g, X + a + 1, Y + b, '#9ab8c0'); }
+    for (let t = 0; t < 12; t++) {
+      const a = Math.floor(hash(tx, ty, 520 + t) * 16), base = 5 + Math.floor(hash(tx, ty, 540 + t) * 11), h = 3 + Math.floor(hash(tx, ty, 560 + t) * 4);
+      R(g, X + a, Y + base - h + 1, 1, h - 1, '#4a6a30'); P1(g, X + a, Y + base - h, t % 3 ? '#9aa85a' : '#c4b878');
+    }
+  }
+  // калюжі
+  for (const [cx, cy, rx] of [[140, 124, 15], [262, 172, 12], [52, 140, 10]]) {
+    const el = (rx2, ry, c) => { g.fillStyle = c; g.beginPath(); g.ellipse(cx, cy, rx2, ry, 0, 0, Math.PI * 2); g.fill(); };
+    el(rx, 6.5, '#5a4a32'); el(rx - 1.5, 5, '#3f6470'); el(rx - 4, 3, '#4f7480');
+    for (let k = 0; k < 3; k++) R(g, cx - rx + 4 + Math.floor(hash(k, cx, 530) * (rx * 2 - 8)), cy - 2 + Math.floor(hash(k, cy, 531) * 4), 3, 1, '#9ab8c0');
+  }
+  // дощаний паркан між городом і пасовищем, з двома дірками
+  for (let tx = 1; tx < 23; tx++) {
+    const X = tx * TS, Y = 56;
+    const gapL = GAPS.some(q => X === q.x0 - TS), gapR = GAPS.some(q => X === q.x1);
+    if (GAPS.some(q => X >= q.x0 && X < q.x1)) { // дірка: обламані дошки лежать у траві
+      if (hash(tx, 3, 600) > 0.4) { R(g, X + 2, Y + 13, 11, 3, '#7c7466'); R(g, X + 2, Y + 11, 11, 1, '#a39b8c'); }
+      continue;
+    }
+    R(g, X, Y + 1, 16, 12, '#5a5246');
+    for (let r = 0; r < 3; r++) { R(g, X, Y + 1 + r * 4, 16, 3, r % 2 ? '#8a8274' : '#7c7466'); R(g, X, Y + 1 + r * 4, 16, 1, '#a39b8c'); }
+    for (let i = 0; i < 16; i++) if (hash(X + i, Y, 170) > 0.8) P1(g, X + i, Y + 2 + Math.floor(hash(X + i, Y, 171) * 9), '#a7b0a0');
+    if (tx % 2 === 0 || gapL || gapR) { const px = gapL ? X + 12 : X + 1; R(g, px, Y - 3, 3, 17, '#4a4238'); R(g, px, Y - 3, 1, 17, '#6a6052'); }
+    if (gapL) { R(g, X + 14, Y + 1, 2, 6, '#3a342c'); } // зламана дошка
+    R(g, X, Y + 13, 16, 2, 'rgba(0,0,0,.25)');
+  }
+})();
+// очерет по краях — окремий верхній шар (корови й Олег заходять «за» нього)
+const reedsC = document.createElement('canvas'); reedsC.width = W; reedsC.height = H;
+(function paintReeds() {
+  const g = reedsC.getContext('2d');
+  const clump = (X, Y) => {
+    for (let k = 0; k < 7; k++) {
+      const sx = X + 2 + Math.floor(hash(k, X + Y, 540) * 12), h = 10 + Math.floor(hash(k, X - Y, 541) * 12), base = Y + 14;
+      R(g, sx, base - h, 1, h, k % 2 ? '#6f8a3a' : '#5a7430');
+      if (k % 3 !== 2) { R(g, sx - 1 + (k & 1), base - h - 4, 2, 5, '#6a4426'); P1(g, sx - 1 + (k & 1), base - h - 4, '#8a5e3a'); P1(g, sx, base - h - 6, '#6f8a3a'); }
+      else { P1(g, sx + 1, base - h + 2, '#8aa04a'); P1(g, sx + 2, base - h + 1, '#8aa04a'); }
+    }
+  };
+  for (let y = 58; y < 240; y += 9) { clump(-4 + (y % 2) * 3, y); clump(372 - (y % 3) * 2, y); }
+  for (let x = 0; x < 384; x += 10) clump(x, 226 + (x % 3));
+  for (let y = -6; y < 58; y += 9) { clump(-6, y); clump(374, y); }
+})();
+
+// ---------- соковита трава: латки, які корови виїдають, а вони потроху відростають ----------
+const PATCHES = [[70, 104], [160, 98], [252, 108], [322, 136], [108, 168], [204, 146], [292, 196], [56, 204], [152, 214]]
+  .map(([x, y], i) => ({ x, y, r:19, amount:1, i }));
+const patchC = PATCHES.map(p => { // pre-drawn lush tufts for each patch; drawn with alpha = how much grass is left
+  const c = document.createElement('canvas'); c.width = 48; c.height = 40; const g = c.getContext('2d');
+  for (let t = 0; t < 70; t++) {
+    const a = hash(p.i, t, 700) * Math.PI * 2, d = Math.sqrt(hash(p.i, t, 701)) * p.r;
+    const x = Math.round(24 + Math.cos(a) * d), y = Math.round(22 + Math.sin(a) * d * 0.62), h = 4 + Math.floor(hash(p.i, t, 702) * 5);
+    R(g, x, y - h + 1, 1, h, t % 3 ? '#3f7a2c' : '#4f8a34'); R(g, x + (t & 1), y - h - 1, 1, 2, t % 4 ? '#8fc45a' : '#b4d878');
+  }
+  for (let t = 0; t < 4; t++) { const x = 10 + Math.floor(hash(p.i, t, 710) * 28), y = 12 + Math.floor(hash(p.i, t, 711) * 16); P1(g, x, y, '#f2efe6'); P1(g, x + 1, y + 1, '#f2efe6'); P1(g, x, y + 1, '#e9c84a'); }
+  return c;
+});
+
+// ---------- корови ----------
+const HERD = [
+  { name:'Зірка', variant:'red', x:196, y:120 }, { name:'Ряба', variant:'spotted', x:120, y:110 }, { name:'Лиска', variant:'holstein', x:270, y:120 },
+  { name:'Чорнушка', variant:'brown', x:150, y:180 }, { name:'Квітка', variant:'holstein', x:240, y:170 }, { name:'Маня', variant:'spotted', x:80, y:150 },
+];
+let cows = [], hero, game, trample = [], toast = null, crack = null;
+function newGame() {
+  cows = HERD.map((c, i) => ({ ...c, i, vx:0, vy:0, facing: i % 2 ? 'left' : 'right', state:'idle', t:0, dur:rnd(0.5, 2), walkT:0,
+    full:0.22 + Math.random() * 0.08, target:null, waypoints:[], crave:rnd(14, 34) + i * 2, scared:0, bolt:0, icon:null, iconT:0, fieldT:0 }));
+  hero = { x:192, y:126, facing:'down', moving:false, walkT:0 };
+  game = { phase:'intro', t:0, damage:0, nextFly:rnd(14, 20), whipCd:0, done:false, sent:false };
+  trample = []; toast = null; crack = null;
+  for (const p of PATCHES) p.amount = 1;
+}
+const herdFull = () => cows.reduce((s, c) => s + Math.min(1, c.full), 0) / cows.length;
+const score = () => clamp(Math.round(herdFull() * 100 - game.damage), 0, 100);
+function say(text, t = 2.2) { toast = { text, t }; }
+function setIcon(c, icon, t) { c.icon = icon; c.iconT = t; }
+
+function nearestGap(x) { return GAPS.reduce((b, g) => Math.abs((g.x0 + g.x1) / 2 - x) < Math.abs((b.x0 + b.x1) / 2 - x) ? g : b); }
+function goTo(c, pts) { c.waypoints = pts.slice(); c.target = c.waypoints.shift(); c.state = 'walk'; }
+function pickPatch(c) {
+  // choose a patch that still has grass: closer and fuller is better, a bit of randomness so they spread out
+  let best = null, bs = -1e9;
+  for (const p of PATCHES) {
+    if (p.amount < 0.12) continue;
+    const others = cows.filter(o => o !== c && o.target && Math.hypot(o.target.x - p.x, o.target.y - p.y) < 12).length;
+    const s = p.amount * 60 - Math.hypot(p.x - c.x, p.y - c.y) * 0.35 - others * 25 + Math.random() * 20;
+    if (s > bs) { bs = s; best = p; }
+  }
+  return best;
+}
+function craveField(c) {
+  // «тягнеться до картоплі»: іде до найближчої дірки в паркані й далі на город
+  const g = nearestGap(c.x), gx = (g.x0 + g.x1) / 2;
+  goTo(c, [{ x:gx, y:84 }, { x:gx, y:52 }, { x:clamp(gx + rnd(-50, 50), 32, 352), y:rnd(47, 53) }]);
+  c.craving = true; setIcon(c, 'grass', 2);
+}
+function decide(c) {
+  if (inField(c.x, c.y)) { c.state = 'eat'; c.t = 0; c.dur = rnd(3, 6); return; } // на городі — жере картоплиння, поки не проженуть
+  c.craving = false;
+  if (c.full < 1) {
+    const p = PATCHES.find(q => q.amount > 0.05 && Math.hypot(q.x - c.x, (q.y - c.y) * 1.4) < q.r * 0.8);
+    if (p) { c.state = 'eat'; c.t = 0; c.dur = rnd(3, 7); c.patch = p; return; }
+    const q = pickPatch(c);
+    if (q) { const a = Math.random() * Math.PI * 2, d = Math.random() * q.r * 0.5; goTo(c, [{ x:q.x + Math.cos(a) * d, y:q.y + Math.sin(a) * d * 0.6 }]); return; }
+  }
+  if (Math.random() < 0.3) { c.state = 'moo'; c.t = 0; c.dur = 1.6; return; }
+  c.state = 'idle'; c.t = 0; c.dur = rnd(1.5, 3.5);
+}
+function moveBody(o, dx, dy, r) {
+  if (!blocked(o.x + dx, o.y, r)) o.x += dx;
+  if (!blocked(o.x, o.y + dy, r)) o.y += dy;
+}
+function faceFrom(c, vx, vy) { if (Math.abs(vx) > 0.01 || Math.abs(vy) > 0.01) c.facing = Math.abs(vx) >= Math.abs(vy) ? (vx > 0 ? 'right' : 'left') : (vy > 0 ? 'down' : 'up'); }
+function updateCow(c, dt) {
+  if (c.iconT > 0) { c.iconT -= dt; if (c.iconT <= 0) c.icon = null; }
+  c.full = Math.max(0, c.full - 0.005 * dt);
+  if (c.scared > 0) c.scared -= dt;
+  let vx = 0, vy = 0, speed = 0;
+  const dh = Math.hypot(c.x - hero.x, c.y - hero.y);
+  const field = inField(c.x, c.y);
+  if (c.bolt > 0) { // ґедзь укусив — несеться навмання
+    c.bolt -= dt; vx = Math.cos(c.boltA); vy = Math.sin(c.boltA); speed = 56;
+    if (blocked(c.x + vx * 4, c.y + vy * 4, 9)) c.boltA += Math.PI * (0.5 + Math.random());
+    if (c.bolt <= 0) decide(c);
+  } else if (dh < 34 || c.scared > 0) {
+    // утікає від Олега; з городу — до найближчої дірки в паркані
+    const src = c.scaredFrom && c.scared > 0 ? c.scaredFrom : hero;
+    let ax = c.x - src.x, ay = c.y - src.y; const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
+    if (field || (c.y < FENCE.y1 + 8 && ay < 0.3)) {
+      const g = nearestGap(c.x), gx = (g.x0 + g.x1) / 2;
+      let tx = gx - c.x, ty = (field ? FENCE.y1 + 14 : 96) - c.y; const tl = Math.hypot(tx, ty) || 1;
+      // стоїть у дірці — просто вниз; на городі — до дірки, трохи вбік від Олега
+      if (Math.abs(c.x - gx) < 8) { tx = 0; ty = 1; } else { tx /= tl; ty /= tl; }
+      if (field) { vx = tx * 0.85 + ax * 0.3; vy = ty * 0.85 + Math.max(0, ay) * 0.3; } else { vx = ax * 0.5 + tx * 0.5; vy = Math.max(ay, 0.4); }
+    } else { vx = ax; vy = ay; }
+    const vl = Math.hypot(vx, vy) || 1; vx /= vl; vy /= vl;
+    speed = c.scared > 0 ? 46 : 22 + (34 - dh) * 0.8;
+    if (c.state !== 'flee') { c.state = 'flee'; c.waypoints = []; c.target = null; c.craving = false; }
+    c.crave = Math.max(c.crave, rnd(10, 22));
+  } else if (c.state === 'flee') { decide(c); }
+  else if (c.state === 'walk' && c.target) {
+    const tx = c.target.x - c.x, ty = c.target.y - c.y, d = Math.hypot(tx, ty);
+    if (d < 3) { c.target = c.waypoints.shift() || null; if (!c.target) decide(c); }
+    else { vx = tx / d; vy = ty / d; speed = c.craving ? 19 : 15; }
+    c.t += dt; if (c.t > 14 && !c.craving) decide(c); // застрягла — передумує
+  } else {
+    c.t += dt;
+    if (c.state === 'eat') {
+      if (field) { c.full = Math.min(1.15, c.full + 0.03 * dt); }
+      else if (c.patch && c.patch.amount > 0.03) { const k = Math.min(1, c.patch.amount * 2); c.full = Math.min(1.15, c.full + 0.021 * k * dt); c.patch.amount = Math.max(0, c.patch.amount - 0.025 * dt); }
+      else c.t = c.dur;
+      if (c.full >= 1 && !field && !c.wasFull) { c.wasFull = true; setIcon(c, 'heart', 1.6); }
+    }
+    if (c.t >= c.dur) decide(c);
+  }
+  // корова на городі — потрава
+  if (field) { game.damage += dt; c.fieldT += dt; if (Math.random() < dt * 3) trample.push({ x:c.x + rnd(-6, 6), y:c.y + rnd(-2, 2), a:1 }); }
+  else c.fieldT = 0;
+  // тягнеться до картоплі (не в перші секунди, і не тоді, коли щойно ганяли)
+  if (c.state !== 'flee' && c.bolt <= 0 && !c.craving && !field && game.t > 8) { c.crave -= dt * (c.full < 0.5 ? 1.4 : 1); if (c.crave <= 0) { c.crave = rnd(26, 46); craveField(c); } }
+  // keep apart from the others
+  for (const o of cows) if (o !== c) {
+    const dx = c.x - o.x, dy = (c.y - o.y) * 1.6, d = Math.hypot(dx, dy);
+    if (d < 20 && d > 0.01) { const p = (20 - d) * 2.2 * dt; moveBody(c, dx / d * p, dy / d * p * 0.6, 9); }
+  }
+  if (speed > 0) {
+    const ox = c.x, oy = c.y;
+    moveBody(c, vx * speed * dt, vy * speed * dt, 9);
+    const mx = c.x - ox, my = c.y - oy;
+    faceFrom(c, mx || vx, my || vy);
+    c.walkT += Math.hypot(mx, my) / 9 + dt * 0.3;
+    c.moving = true;
+  } else { c.moving = false; c.walkT = 0; if ((c.state === 'eat' || c.state === 'moo' || c.state === 'idle') && (c.facing === 'up' || c.facing === 'down')) c.facing = c.i % 2 ? 'left' : 'right'; }
+}
+function gadfly() {
+  const calm = cows.filter(c => c.bolt <= 0 && !inField(c.x, c.y));
+  if (!calm.length) return;
+  const c = calm[Math.floor(Math.random() * calm.length)];
+  c.bolt = rnd(2.2, 3.2); c.boltA = Math.random() * Math.PI * 2; c.state = 'bolt'; c.waypoints = []; c.target = null;
+  setIcon(c, 'alert', 1.4); say(`Ґедзь укусив ${c.name === 'Зірка' ? 'Зірку' : c.name === 'Ряба' ? 'Рябу' : c.name === 'Лиска' ? 'Лиску' : c.name === 'Чорнушка' ? 'Чорнушку' : c.name === 'Квітка' ? 'Квітку' : 'Маню'}!`);
+}
+
+// ---------- керування: фізичні клавіші, остання натиснута перемагає (окремо по горизонталі й вертикалі) ----------
+const CODE_DIR = { KeyW:'up', ArrowUp:'up', KeyS:'down', ArrowDown:'down', KeyA:'left', ArrowLeft:'left', KeyD:'right', ArrowRight:'right' };
+const input = {
+  held: [], run: new Set(), pointer: null,
+  press(code, dir) { this.release(code); this.held.push({ code, dir }); },
+  release(code) { const i = this.held.findIndex(h => h.code === code); if (i >= 0) this.held.splice(i, 1); },
+  axis(a, b) { for (let i = this.held.length - 1; i >= 0; i--) { const d = this.held[i].dir; if (d === a) return -1; if (d === b) return 1; } return 0; },
+  clear() { this.held.length = 0; this.run.clear(); this.pointer = null; },
+};
+addEventListener('keydown', e => {
+  if (e.code === 'Escape') { send('mini-close'); return; }
+  if (e.code in CODE_DIR || e.code === 'Space' || e.code === 'Enter') e.preventDefault();
+  if (e.repeat) return;
+  const d = CODE_DIR[e.code];
+  if (d) { input.press(e.code, d); return; }
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight' || e.code === 'KeyX') input.run.add(e.code);
+  else if (e.code === 'KeyE' || e.code === 'Space' || e.code === 'Enter' || e.code === 'KeyZ') act();
+});
+addEventListener('keyup', e => { input.release(e.code); input.run.delete(e.code); });
+addEventListener('blur', () => input.clear());
+document.addEventListener('visibilitychange', () => { if (document.hidden) input.clear(); });
+
+function toGame(e) { const r = cv.getBoundingClientRect(); return { x:(e.clientX - r.left) * W / r.width, y:(e.clientY - r.top) * H / r.height }; }
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); if (e.pointerType === 'touch') document.body.classList.add('touch');
+  const p = toGame(e);
+  if (game.phase !== 'play') { const b = overlayButtons().find(b => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h); if (b) b.fn(); else if (game.phase === 'intro') start(); return; }
+  try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+  input.pointer = { id:e.pointerId, x:p.x, y:p.y, t0:performance.now(), sx:p.x, sy:p.y };
+});
+cv.addEventListener('pointermove', e => { const q = input.pointer; if (q && q.id === e.pointerId) Object.assign(q, toGame(e)); });
+for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) cv.addEventListener(ev, e => {
+  const q = input.pointer; if (!q || q.id !== e.pointerId) return;
+  if (ev === 'pointerup' && performance.now() - q.t0 < 220 && Math.hypot(q.x - q.sx, q.y - q.sy) < 6) act(); // короткий дотик — ляснути батогом
+  input.pointer = null;
+});
+const whipBtn = document.getElementById('whip');
+whipBtn.addEventListener('pointerdown', e => { e.preventDefault(); act(); });
+if (matchMedia('(pointer:coarse)').matches) document.body.classList.add('touch');
+
+function start() { newGame(); game.phase = 'play'; input.clear(); say('Пасемо до вечора! Не пускай корів на город.', 2.6); }
+function act() {
+  if (game.phase === 'intro') { start(); return; }
+  if (game.phase === 'end') { start(); return; }
+  if (game.whipCd > 0) return;
+  game.whipCd = 0.8;
+  const [fx, fy] = { up:[0, -1], down:[0, 1], left:[-1, 0], right:[1, 0] }[hero.facing];
+  const cx = hero.x + fx * 16, cy = hero.y - 6 + fy * 12;
+  crack = { x:cx, y:cy, t:0.35, f:hero.facing };
+  for (const c of cows) {
+    const d = Math.hypot(c.x - cx, c.y - cy);
+    if (d < 80) { c.scared = 1.3 * (1 - d / 120); c.scaredFrom = { x:hero.x, y:hero.y }; c.bolt = 0; setIcon(c, 'alert', 0.8); }
+  }
+}
+function overlayButtons() {
+  if (game.phase === 'end') return [
+    { x:96, y:178, w:90, h:22, text:'Ще раз', fn:start },
+    { x:198, y:178, w:90, h:22, text:'Назад у Вербу', fn:() => send('mini-close') },
+  ];
+  if (game.phase === 'intro') return [{ x:142, y:182, w:100, h:22, text:'Почати', fn:start }];
+  return [];
+}
+
+// ---------- update ----------
+function update(dt) {
+  if (toast) { toast.t -= dt; if (toast.t <= 0) toast = null; }
+  if (crack) { crack.t -= dt; if (crack.t <= 0) crack = null; }
+  for (const m of trample) m.a -= dt * 0.04;
+  trample = trample.filter(m => m.a > 0).slice(-160);
+  if (game.phase !== 'play') return;
+  game.t += dt; game.whipCd = Math.max(0, game.whipCd - dt);
+  // hero
+  let mx = input.axis('left', 'right'), my = input.axis('up', 'down');
+  const q = input.pointer;
+  if (q && performance.now() - q.t0 > 120) { const dx = q.x - hero.x, dy = q.y - hero.y, d = Math.hypot(dx, dy); if (d > 4) { mx = dx / d; my = dy / d; } }
+  const ml = Math.hypot(mx, my);
+  if (ml > 0) {
+    mx /= ml; my /= ml;
+    const run = input.run.size > 0, sp = run ? 96 : 62;
+    const ox = hero.x, oy = hero.y;
+    moveBody(hero, mx * sp * dt, my * sp * dt, 5);
+    // facing: the latest pressed key (keyboard) or the main axis of travel (pointer)
+    const last = input.held[input.held.length - 1];
+    hero.facing = last && !q ? last.dir : (Math.abs(mx) >= Math.abs(my) ? (mx > 0 ? 'right' : 'left') : (my > 0 ? 'down' : 'up'));
+    const moved = Math.hypot(hero.x - ox, hero.y - oy);
+    hero.walkT += (moved > 0.01 ? moved / 16 : dt * 2) * 2; hero.moving = true; hero.run = run;
+  } else { hero.moving = false; hero.walkT = 0; }
+  for (const c of cows) updateCow(c, dt);
+  for (const p of PATCHES) p.amount = Math.min(1, p.amount + 0.005 * dt);
+  game.nextFly -= dt; if (game.nextFly <= 0) { game.nextFly = rnd(12, 19); gadfly(); }
+  const inF = cows.filter(c => inField(c.x, c.y));
+  if (inF.length && !game.warned) { game.warned = true; say(`${inF[0].name} на городі! Жени її назад!`); }
+  if (!inF.length) game.warned = false;
+  if (game.t >= DAY) finish();
+}
+function finish() {
+  game.phase = 'end'; input.clear();
+  game.result = { score:score(), full:Math.round(herdFull() * 100), damage:Math.round(game.damage) };
+  send('pasture-done', game.result);
+}
+
+// ---------- render ----------
+let K = 1;
+function resize() {
+  const vw = innerWidth - 12, vh = innerHeight - 12, s = Math.max(1, Math.min(vw / W, vh / H));
+  const cssW = Math.floor(W * s), cssH = Math.floor(H * s), dpr = window.devicePixelRatio || 1;
+  cv.style.width = cssW + 'px'; cv.style.height = cssH + 'px';
+  cv.width = Math.round(cssW * dpr); cv.height = Math.round(cssH * dpr); K = cv.width / W;
+}
+addEventListener('resize', resize);
+const font = (px, bold) => `${bold ? 600 : 400} ${px}px ${FONT}`;
+function panel(x, y, w, h, fill = '#fbf2d4', edge = '#2f4c86') { R(ctx, x - 1, y - 1, w + 2, h + 2, edge); R(ctx, x, y, w, h, fill); }
+function cowFrame(c) {
+  const s = COW[c.variant], side = c.facing === 'left' || c.facing === 'right', flip = c.facing === 'left';
+  if (c.moving) { const fr = s['walk_' + c.facing], n = fr.length; return { img:fr[Math.floor(c.walkT * (n === 4 ? 1.6 : 1.3)) % n], flip:false }; }
+  if (!side) return { img:s['walk_' + c.facing][0], flip:false };
+  if (c.state === 'eat') return { img:s.eat[Math.floor(c.t * 2.5) % 3], flip };
+  if (c.state === 'moo') return { img:s.moo[c.t < 0.45 ? 0 : 1], flip };
+  return { img:s.idle[Math.floor(c.t * 1.4) % 2], flip };
+}
+function drawCow(c) {
+  const { img, flip } = cowFrame(c), cx = Math.round(c.x), b = Math.round(c.y);
+  shadow(cx, b - 1, 11);
+  sprite(img, cx, b + 1, COW_K, flip);
+  const top = b - ((img && img.naturalHeight) || 60) * COW_K;
+  // ситість — маленька смужка під коровою
+  const f = Math.min(1, c.full);
+  R(ctx, cx - 9, b + 3, 18, 3, '#2a2a20'); R(ctx, cx - 8, b + 4, Math.round(16 * f), 1, f > 0.7 ? '#9be06a' : f > 0.4 ? '#e8c84a' : '#e07050');
+  if (c.name === 'Зірка') { ctx.font = font(6, true); ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillStyle = '#1c1a24'; ctx.fillText('Зірка', cx + 0.5, top - 1.5); ctx.fillStyle = '#ffe9a8'; ctx.fillText('Зірка', cx, top - 2); }
+  if (c.icon) sprite(FX[c.icon], cx + (c.name === 'Зірка' ? 14 : 0), top - 2 + Math.sin(performance.now() / 250) * 1.5, 0.3, false);
+}
+function drawHero() {
+  shadow(hero.x, hero.y - 1, 6);
+  if (!hero.moving) return sprite(HERO.idle[hero.facing], hero.x, hero.y + 1, HERO_K, false);
+  const fr = (hero.run ? HERO.run : HERO.walk)[hero.facing];
+  sprite(fr[Math.floor(hero.walkT) % 4], hero.x, hero.y + 1 + 2 * HERO_K, HERO_K, false);
+}
+function drawCrack() {
+  if (!crack) return;
+  const k = crack.t / 0.35, [fx, fy] = { up:[0, -1], down:[0, 1], left:[-1, 0], right:[1, 0] }[crack.f];
+  ctx.strokeStyle = '#4a3020'; ctx.lineWidth = 1.2; ctx.beginPath();
+  const hx = hero.x + fx * 4, hy = hero.y - 12;
+  ctx.moveTo(hx, hy);
+  ctx.quadraticCurveTo(hx + fx * 14 - fy * 8 * k, hy + fy * 10 - 6 * k + fx * 2, crack.x, crack.y);
+  ctx.stroke();
+  ctx.globalAlpha = k; ctx.fillStyle = '#fff6c0';
+  for (let i = 0; i < 6; i++) { const a = i / 6 * Math.PI * 2; ctx.fillRect(crack.x + Math.cos(a) * (3 + (1 - k) * 6), crack.y + Math.sin(a) * (3 + (1 - k) * 6), 1.5, 1.5); }
+  ctx.font = font(7, true); ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillStyle = '#2a1a10'; ctx.fillText('ЛЯСЬ!', crack.x + 0.5, crack.y - 5.5); ctx.fillStyle = '#ffe9a8'; ctx.fillText('ЛЯСЬ!', crack.x, crack.y - 6);
+  ctx.globalAlpha = 1;
+}
+function drawHud() {
+  // сонце йде від ранку до вечора
+  const k = game.phase === 'play' ? clamp(game.t / DAY, 0, 1) : game.phase === 'end' ? 1 : 0;
+  panel(118, 4, 148, 15, '#f4e6c0', '#5a3f26');
+  ctx.font = font(6, true); ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.fillStyle = '#5a3f26'; ctx.fillText('ранок', 122, 11.5);
+  ctx.textAlign = 'right'; ctx.fillText('вечір', 262, 11.5);
+  R(ctx, 146, 11, 92, 1, '#c9b07a');
+  const sx = 146 + 92 * k, sy = 11.5 - Math.sin(k * Math.PI) * 4;
+  ctx.fillStyle = k > 0.8 ? '#e8743a' : '#f0b828'; ctx.beginPath(); ctx.arc(sx, sy, 3.2, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = '#fff2b0'; ctx.fillRect(sx - 1, sy - 1.5, 1.5, 1.5);
+  // ситість череди
+  const f = herdFull();
+  panel(6, 4, 104, 15, '#f4e6c0', '#5a3f26');
+  ctx.textAlign = 'left'; ctx.fillStyle = '#3a2c1c'; ctx.fillText('Череда сита', 10, 11.5);
+  R(ctx, 58, 8, 48, 7, '#5a4a32'); R(ctx, 59, 9, Math.round(46 * f), 5, f > 0.7 ? '#7cc850' : f > 0.4 ? '#d8b83a' : '#d06a48');
+  ctx.font = font(5.5, true); ctx.textAlign = 'center'; ctx.fillStyle = '#1c1a10'; ctx.fillText(Math.round(f * 100) + '%', 82, 11.8);
+  // потрава
+  panel(274, 4, 104, 15, game.damage > 0.5 ? '#f6d4c4' : '#f4e6c0', '#5a3f26');
+  ctx.font = font(6, true); ctx.textAlign = 'left'; ctx.fillStyle = game.damage > 0.5 ? '#8a2a1a' : '#3a2c1c';
+  ctx.fillText(`Потрава городу: ${Math.round(game.damage)} с`, 278, 11.5);
+  if (toast) {
+    ctx.font = font(7.5, true); const w = ctx.measureText(toast.text).width + 14;
+    ctx.globalAlpha = Math.min(1, toast.t * 3); panel((W - w) / 2, 24, w, 13);
+    ctx.fillStyle = '#2e2a26'; ctx.textAlign = 'center'; ctx.fillText(toast.text, W / 2, 31); ctx.globalAlpha = 1;
+  }
+}
+function drawOverlay() {
+  if (game.phase === 'play') return;
+  ctx.fillStyle = 'rgba(12,20,28,.55)'; ctx.fillRect(0, 0, W, H);
+  panel(56, 40, 272, 170, '#f7f2e2', '#2f4c86'); R(ctx, 60, 44, 264, 1, '#c3cde3');
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#2f4c86';
+  if (game.phase === 'intro') {
+    ctx.font = font(12, true); ctx.fillText('Череда до вечора', W / 2, 58);
+    ctx.font = font(7.5); ctx.fillStyle = '#303040';
+    const lines = ['Пастух Микола захворів — сьогодні череду пасе Олег.', 'Веди корів до соковитої трави — так вони наїдяться.',
+      'Через дірки в паркані вони пруть на город.', 'Підійди ближче — корова відійде від тебе;', 'батіг (E / Пробіл, дотик) лякає всіх поруч.',
+      'Ґедзі кусають — тоді корова несеться навмання.', 'До вечора череда має бути сита, а город — цілий.'];
+    lines.forEach((l, i) => ctx.fillText(l, W / 2, 80 + i * 13));
+    ctx.font = font(6.5); ctx.fillStyle = '#6a6a7a'; ctx.fillText('WASD / стрілки — ходити · Shift — бігти · Esc — назад у Вербу', W / 2, 172);
+  } else {
+    const r = game.result;
+    ctx.font = font(12, true); ctx.fillText('Вечір! Череда — додому', W / 2, 58);
+    ctx.font = font(9, true); ctx.fillStyle = '#303040';
+    ctx.fillText(`Череда сита: ${r.full}%`, W / 2, 84); ctx.fillText(`Потрава городу: ${r.damage} с`, W / 2, 100);
+    ctx.font = font(11, true); ctx.fillStyle = '#7a3a20'; ctx.fillText(`Оцінка: ${r.score} / 100`, W / 2, 124);
+    ctx.font = font(8); ctx.fillStyle = '#303040';
+    ctx.fillText(r.score >= 80 ? 'Як справжній пастух! Корови аж лиснять.' : r.score >= 50 ? 'Непогано. Ще трохи — і Микола позаздрить.' : 'Корови голодні, а город потоптаний…', W / 2, 146);
+  }
+  for (const b of overlayButtons()) {
+    panel(b.x, b.y, b.w, b.h, '#e9d8a6', '#5a3f26');
+    ctx.font = font(8, true); ctx.fillStyle = '#2a1f16'; ctx.textAlign = 'center'; ctx.fillText(b.text, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+  }
+}
+function render() {
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(bg, 0, 0);
+  for (const m of trample) { ctx.globalAlpha = Math.min(1, m.a) * 0.8; R(ctx, Math.round(m.x) - 2, Math.round(m.y), 4, 2, '#3a281c'); R(ctx, Math.round(m.x) - 1, Math.round(m.y) - 1, 2, 1, '#2c1e14'); }
+  ctx.globalAlpha = 1;
+  PATCHES.forEach((p, i) => { ctx.globalAlpha = 0.15 + 0.85 * p.amount; ctx.drawImage(patchC[i], p.x - 24, p.y - 22); });
+  ctx.globalAlpha = 1;
+  const list = cows.map(c => ({ y:c.y, d:() => drawCow(c) }));
+  list.push({ y:hero.y + 0.5, d:drawHero });
+  for (const p of PROPS) list.push({ y:p.y, d:() => { shadow(p.x, p.y - 1, p.w / 2); sprite(FX[p.img], p.x, p.y + 1, p.s, false); } });
+  list.sort((a, b) => a.y - b.y).forEach(o => o.d());
+  drawCrack();
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(reedsC, 0, 0);
+  // вечір: тепле світло наприкінці дня
+  const k = game.phase === 'play' ? game.t / DAY : game.phase === 'end' ? 1 : 0;
+  if (k > 0.6) { ctx.fillStyle = `rgba(232,120,50,${(k - 0.6) * 0.45})`; ctx.fillRect(0, 0, W, H); }
+  drawHud();
+  drawOverlay();
+}
+
+// ---------- loop ----------
+newGame(); resize();
+let last = performance.now();
+function frame(t) { const dt = Math.min(0.05, Math.max(0, (t - last) / 1000)); last = t; update(dt); render(); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+window.PASTURE = { get game() { return game; }, get cows() { return cows; }, get hero() { return hero; }, input, update, render, act, start, finish, PATCHES, blocked, inField, score };
+send('pasture-ready');
+</script>
+</body>
+</html>
